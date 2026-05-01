@@ -5,4 +5,10 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "0.31", features = ["default"] }
-global-hotkey = "0.6"
+egui = "0.31"
+rdev = "0.5"
+parking_lot = "0.12"
+winreg = { version = "0.52", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

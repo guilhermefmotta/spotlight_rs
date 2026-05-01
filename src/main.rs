@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, Sense, Stroke, StrokeKind, Vec2};
+use rdev::{listen, Event, EventType, Key as RdevKey};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{mpsc, Arc, Mutex};
 
 const W: f32 = 640.0;
 const SEARCH_H: f32 = 64.0;
@@ -11,6 +13,40 @@ const MAX_ITEMS: usize = 8;
 const RADIUS: CornerRadius = CornerRadius::same(12);
 
 fn main() -> eframe::Result {
+    // Create channel for hotkey events
+    let (tx, rx) = mpsc::channel();
+    let alt_pressed = Arc::new(Mutex::new(false));
+    let alt_pressed_clone = alt_pressed.clone();
+
+    // Spawn hotkey listener thread
+    std::thread::spawn(move || {
+        let callback = move |event: Event| {
+            match event.event_type {
+                EventType::KeyPress(key) => {
+                    // Check for Alt key
+                    if key == RdevKey::Alt {
+                        *alt_pressed_clone.lock().unwrap() = true;
+                    }
+                    // Check for D key while Alt is pressed
+                    if key == RdevKey::KeyD && *alt_pressed_clone.lock().unwrap() {
+                        let _ = tx.send(());
+                    }
+                }
+                EventType::KeyRelease(key) => {
+                    if key == RdevKey::Alt {
+                        *alt_pressed_clone.lock().unwrap() = false;
+                    }
+                }
+                _ => {}
+            }
+        };
+
+        // Listen for events
+        if let Err(error) = listen(callback) {
+            eprintln!("Error: {:?}", error);
+        }
+    });
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Spotlight")
@@ -18,13 +54,14 @@ fn main() -> eframe::Result {
             .with_decorations(false)
             .with_always_on_top()
             .with_transparent(true)
-            .with_resizable(false),
+            .with_resizable(false)
+            .with_visible(false), // Start hidden
         ..Default::default()
     };
     eframe::run_native(
         "Spotlight",
         options,
-        Box::new(|cc| Ok(Box::new(Spotlight::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(Spotlight::new(cc, rx)))),
     )
 }
 
@@ -42,10 +79,12 @@ struct Spotlight {
     selected: usize,
     need_focus: bool,
     positioned: bool,
+    visible: bool,
+    hotkey_rx: mpsc::Receiver<()>,
 }
 
 impl Spotlight {
-    fn new(_cc: &eframe::CreationContext) -> Self {
+    fn new(_cc: &eframe::CreationContext, hotkey_rx: mpsc::Receiver<()>) -> Self {
         Self {
             query: String::new(),
             all: scan_desktop_files(),
@@ -53,6 +92,8 @@ impl Spotlight {
             selected: 0,
             need_focus: true,
             positioned: false,
+            visible: false,
+            hotkey_rx,
         }
     }
 
@@ -72,6 +113,20 @@ impl Spotlight {
             launch_exec(&app.exec);
         }
     }
+
+    fn show(&mut self) {
+        self.visible = true;
+        self.query.clear();
+        self.filter();
+        self.need_focus = true;
+        self.positioned = false;
+    }
+
+    fn hide(&mut self) {
+        self.visible = false;
+        self.query.clear();
+        self.results.clear();
+    }
 }
 
 impl eframe::App for Spotlight {
@@ -80,6 +135,22 @@ impl eframe::App for Spotlight {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Check for hotkey events
+        while let Ok(()) = self.hotkey_rx.try_recv() {
+            if self.visible {
+                self.hide();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.show();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+        }
+
+        // If hidden, don't render anything
+        if !self.visible {
+            return;
+        }
+
         // Position window on first frame: horizontally centered, ~28% from top
         if !self.positioned {
             if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
@@ -114,7 +185,8 @@ impl eframe::App for Spotlight {
             close = true;
         }
         if close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.hide();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             return;
         }
 
@@ -243,6 +315,22 @@ impl eframe::App for Spotlight {
 // ── App discovery ────────────────────────────────────────────────────────────
 
 fn scan_desktop_files() -> Vec<App> {
+    #[cfg(target_os = "linux")]
+    {
+        scan_linux_apps()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        scan_windows_apps()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scan_linux_apps() -> Vec<App> {
     let home = std::env::var("HOME").unwrap_or_default();
     let static_dirs: &[&str] = &[
         "/usr/share/applications",
@@ -278,6 +366,59 @@ fn scan_desktop_files() -> Vec<App> {
     apps
 }
 
+#[cfg(target_os = "windows")]
+fn scan_windows_apps() -> Vec<App> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+
+    let mut apps = Vec::new();
+
+    // Scan uninstall registry keys for installed applications
+    let keys = [
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ];
+
+    for key_path in &keys {
+        if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(key_path) {
+            for subkey_name in key.enum_keys().flatten() {
+                if let Ok(subkey) = key.open_subkey(&subkey_name) {
+                    // Try to get DisplayName
+                    if let Ok(display_name) = subkey.get_value::<String, _>("DisplayName") {
+                        // Try to get executable path - look for common registry values
+                        let exec = subkey
+                            .get_value::<String, _>("DisplayIcon")
+                            .or_else(|_| subkey.get_value::<String, _>("InstallLocation"))
+                            .ok()
+                            .and_then(|path| {
+                                // Clean up paths: remove quotes and extract just the executable path
+                                let clean_path = path.trim_matches('"').to_string();
+                                Some(clean_path)
+                            });
+
+                        if let Some(exec_path) = exec {
+                            // Skip entries without executables or system entries
+                            if !exec_path.is_empty() && !display_name.contains("Update") {
+                                let app = App {
+                                    name: display_name,
+                                    exec: exec_path,
+                                    comment: None,
+                                };
+                                apps.push(app);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    apps.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    apps.dedup_by(|a, b| a.name == b.name);
+    apps
+}
+
+#[cfg(target_os = "linux")]
 fn parse_desktop(path: &PathBuf) -> Option<App> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut name: Option<String> = None;
