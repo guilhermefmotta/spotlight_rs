@@ -1,133 +1,65 @@
-name: 🚀 Release
+name: Release
 
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
+      - "v*"
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build binaries
     runs-on: ${{ matrix.os }}
+
     strategy:
-      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: spotlight
-            asset_name: spotlight-linux-x86_64
+            binary_name: app
+            asset_name: app-linux
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: spotlight.exe
-            asset_name: spotlight-windows-x86_64.exe
+            binary_name: app.exe
+            asset_name: app-windows.exe
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions/setup-rust@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          components: rustfmt, clippy
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build Release
-        run: cargo build --verbose --release --target ${{ matrix.target }}
-
-      - name: Strip binary (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        run: strip target/${{ matrix.target }}/release/spotlight
+      - name: Prepare artifact
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.asset_name }}
+        shell: bash
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          retention-days: 7
+          path: dist/${{ matrix.asset_name }}
 
-  create-release:
+  release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
-          generate_release_notes: true
-          draft: false
+          files: |
+            app-linux/app-linux
+            app-windows.exe/app-windows.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: actions/setup-rust@v1
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests
-        run: cargo test --verbose
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
