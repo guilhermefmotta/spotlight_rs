@@ -1,51 +1,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, Sense, Stroke, StrokeKind, Vec2};
-use rdev::{listen, Event, EventType, Key as RdevKey};
-use std::path::PathBuf;
+use eframe::egui::{self, Align2, Color32, ColorImage, CornerRadius, FontId, Key, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::{Code, HotKey, Modifiers}};
+use image::DynamicImage;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{mpsc, Arc, Mutex};
 
 const W: f32 = 640.0;
 const SEARCH_H: f32 = 64.0;
 const ITEM_H: f32 = 46.0;
+const ICON_SIZE: f32 = 28.0;
 const MAX_ITEMS: usize = 8;
 const RADIUS: CornerRadius = CornerRadius::same(12);
 
 fn main() -> eframe::Result {
-    // Create channel for hotkey events
-    let (tx, rx) = mpsc::channel();
-    let alt_pressed = Arc::new(Mutex::new(false));
-    let alt_pressed_clone = alt_pressed.clone();
-
-    // Spawn hotkey listener thread
-    std::thread::spawn(move || {
-        let callback = move |event: Event| {
-            match event.event_type {
-                EventType::KeyPress(key) => {
-                    // Check for Alt key
-                    if key == RdevKey::Alt {
-                        *alt_pressed_clone.lock().unwrap() = true;
-                    }
-                    // Check for D key while Alt is pressed
-                    if key == RdevKey::KeyD && *alt_pressed_clone.lock().unwrap() {
-                        let _ = tx.send(());
-                    }
-                }
-                EventType::KeyRelease(key) => {
-                    if key == RdevKey::Alt {
-                        *alt_pressed_clone.lock().unwrap() = false;
-                    }
-                }
-                _ => {}
-            }
-        };
-
-        // Listen for events
-        if let Err(error) = listen(callback) {
-            eprintln!("Error: {:?}", error);
-        }
-    });
+    // Set up global hotkey manager on the main thread.
+    let hotkey_manager = GlobalHotKeyManager::new().ok();
+    let hotkey = HotKey::new(Some(Modifiers::ALT), Code::KeyD);
+    if let Some(manager) = &hotkey_manager {
+        let _ = manager.register(hotkey);
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -58,10 +33,11 @@ fn main() -> eframe::Result {
             .with_visible(false), // Start hidden
         ..Default::default()
     };
+    let hotkey_id = hotkey.id();
     eframe::run_native(
         "Spotlight",
         options,
-        Box::new(move |cc| Ok(Box::new(Spotlight::new(cc, rx)))),
+        Box::new(move |cc| Ok(Box::new(Spotlight::new(cc, hotkey_manager, hotkey_id)))),
     )
 }
 
@@ -70,6 +46,7 @@ struct App {
     name: String,
     exec: String,
     comment: Option<String>,
+    icon: Option<String>,
 }
 
 struct Spotlight {
@@ -80,11 +57,13 @@ struct Spotlight {
     need_focus: bool,
     positioned: bool,
     visible: bool,
-    hotkey_rx: mpsc::Receiver<()>,
+    _hotkey_manager: Option<GlobalHotKeyManager>,
+    hotkey_id: u32,
+    icons: HashMap<String, TextureHandle>,
 }
 
 impl Spotlight {
-    fn new(_cc: &eframe::CreationContext, hotkey_rx: mpsc::Receiver<()>) -> Self {
+    fn new(_cc: &eframe::CreationContext, hotkey_manager: Option<GlobalHotKeyManager>, hotkey_id: u32) -> Self {
         Self {
             query: String::new(),
             all: scan_desktop_files(),
@@ -93,7 +72,9 @@ impl Spotlight {
             need_focus: true,
             positioned: false,
             visible: false,
-            hotkey_rx,
+            _hotkey_manager: hotkey_manager,
+            hotkey_id,
+            icons: HashMap::new(),
         }
     }
 
@@ -127,6 +108,20 @@ impl Spotlight {
         self.query.clear();
         self.results.clear();
     }
+
+    fn get_icon_by_ref(&mut self, ctx: &egui::Context, icon_ref: String) -> Option<&TextureHandle> {
+        let key = icon_ref.clone();
+        let entry = self.icons.entry(key.clone());
+        match entry {
+            std::collections::hash_map::Entry::Occupied(o) => Some(o.into_mut()),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let path = resolve_icon_path(&icon_ref)?;
+                let image = load_icon_image(&path)?;
+                let texture = ctx.load_texture(key, image, TextureOptions::NEAREST);
+                Some(v.insert(texture))
+            }
+        }
+    }
 }
 
 impl eframe::App for Spotlight {
@@ -135,14 +130,16 @@ impl eframe::App for Spotlight {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check for hotkey events
-        while let Ok(()) = self.hotkey_rx.try_recv() {
-            if self.visible {
-                self.hide();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            } else {
-                self.show();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        // Check for global hotkey events.
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if event.id() == self.hotkey_id && event.state() == HotKeyState::Pressed {
+                if self.visible {
+                    self.hide();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                } else {
+                    self.show();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
             }
         }
 
@@ -265,7 +262,9 @@ impl eframe::App for Spotlight {
                         .max_height(MAX_ITEMS as f32 * ITEM_H)
                         .show(ui, |ui| {
                             let w = ui.available_width();
-                            for (i, app) in self.results.iter().enumerate().take(MAX_ITEMS) {
+                            let max_results = self.results.len().min(MAX_ITEMS);
+                            for i in 0..max_results {
+                                let app = self.results[i].clone();
                                 let is_sel = i == self.selected;
                                 let (row, resp) =
                                     ui.allocate_exact_size(Vec2::new(w, ITEM_H), Sense::click());
@@ -286,9 +285,44 @@ impl eframe::App for Spotlight {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 }
 
+                                let icon_center = row.min + Vec2::new(12.0 + ICON_SIZE / 2.0, ITEM_H / 2.0);
+                                let icon_rect = egui::Rect::from_center_size(icon_center, Vec2::splat(ICON_SIZE));
+                                let icon_texture = if let Some(icon_ref) = app.icon.clone() {
+                                    self.get_icon_by_ref(ctx, icon_ref)
+                                } else {
+                                    None
+                                };
+                                if let Some(texture) = icon_texture {
+                                    ui.painter().rect_filled(icon_rect, CornerRadius::same((ICON_SIZE / 2.0) as u8), Color32::from_gray(30));
+                                    ui.painter().image(
+                                        texture.id(),
+                                        icon_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        Color32::WHITE,
+                                    );
+                                } else {
+                                    ui.painter().circle_filled(icon_center, ICON_SIZE / 2.0, Color32::from_gray(50));
+                                    let icon_text = app
+                                        .name
+                                        .chars()
+                                        .next()
+                                        .map(|c| c.to_string())
+                                        .unwrap_or_else(|| "?".to_string());
+                                    ui.painter().text(
+                                        icon_center,
+                                        Align2::CENTER_CENTER,
+                                        icon_text,
+                                        FontId::proportional(14.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+
                                 // App name
                                 ui.painter().text(
-                                    row.min + Vec2::new(22.0, 8.0),
+                                    row.min + Vec2::new(12.0 + ICON_SIZE + 16.0, 8.0),
                                     Align2::LEFT_TOP,
                                     &app.name,
                                     FontId::proportional(16.0),
@@ -298,7 +332,7 @@ impl eframe::App for Spotlight {
                                 // Description
                                 if let Some(c) = &app.comment {
                                     ui.painter().text(
-                                        row.min + Vec2::new(22.0, 28.0),
+                                        row.min + Vec2::new(12.0 + ICON_SIZE + 16.0, 28.0),
                                         Align2::LEFT_TOP,
                                         c,
                                         FontId::proportional(12.0),
@@ -386,10 +420,10 @@ fn scan_windows_apps() -> Vec<App> {
                     // Try to get DisplayName
                     if let Ok(display_name) = subkey.get_value::<String, _>("DisplayName") {
                         // Try to get executable path - look for common registry values
-                        let exec = subkey
-                            .get_value::<String, _>("DisplayIcon")
-                            .or_else(|_| subkey.get_value::<String, _>("InstallLocation"))
-                            .ok()
+                        let raw_icon = subkey.get_value::<String, _>("DisplayIcon").ok();
+                        let exec = raw_icon
+                            .clone()
+                            .or_else(|| subkey.get_value::<String, _>("InstallLocation").ok())
                             .and_then(|path| {
                                 // Clean up paths: remove quotes and extract just the executable path
                                 let clean_path = path.trim_matches('"').to_string();
@@ -403,6 +437,7 @@ fn scan_windows_apps() -> Vec<App> {
                                     name: display_name,
                                     exec: exec_path,
                                     comment: None,
+                                    icon: raw_icon.map(|i| i.trim_matches('"').to_string()),
                                 };
                                 apps.push(app);
                             }
@@ -424,6 +459,7 @@ fn parse_desktop(path: &PathBuf) -> Option<App> {
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
     let mut comment: Option<String> = None;
+    let mut icon: Option<String> = None;
     let mut in_entry = false;
     let mut is_app = false;
     let mut skip = false;
@@ -452,6 +488,10 @@ fn parse_desktop(path: &PathBuf) -> Option<App> {
             }
         } else if let Some(v) = line.strip_prefix("Exec=") {
             exec = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("Icon=") {
+            if icon.is_none() {
+                icon = Some(v.to_string());
+            }
         } else if let Some(v) = line.strip_prefix("Comment=") {
             if comment.is_none() {
                 comment = Some(v.to_string());
@@ -468,6 +508,7 @@ fn parse_desktop(path: &PathBuf) -> Option<App> {
         name: name?,
         exec: exec?,
         comment,
+        icon,
     })
 }
 
@@ -479,4 +520,75 @@ fn launch_exec(exec: &str) {
     if let Some((cmd, rest)) = args.split_first() {
         Command::new(cmd).args(rest).spawn().ok();
     }
+}
+
+fn load_icon_image(path: &Path) -> Option<ColorImage> {
+    let data = std::fs::read(path).ok()?;
+    let image = image::load_from_memory(&data).ok()?;
+    let image = match image {
+        DynamicImage::ImageRgba8(img) => img,
+        img => img.to_rgba8(),
+    };
+    let resized = image::imageops::resize(&image, ICON_SIZE as u32, ICON_SIZE as u32, image::imageops::FilterType::Lanczos3);
+    let samples = resized.as_flat_samples();
+    let pixels = samples.as_slice();
+    Some(ColorImage::from_rgba_unmultiplied([ICON_SIZE as usize, ICON_SIZE as usize], pixels))
+}
+
+fn resolve_icon_path(icon_ref: &str) -> Option<PathBuf> {
+    let raw = icon_ref.trim_matches('"');
+    let raw = raw.split(',').next().unwrap_or(raw).trim();
+    let path = Path::new(raw);
+    if path.exists() && path.is_file() {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+            let supported = ["png", "ico", "jpg", "jpeg", "bmp"];
+            if supported.contains(&ext.as_str()) {
+                return Some(path.to_path_buf());
+            }
+            if ext == "exe" {
+                let icon_candidate = path.with_extension("ico");
+                if icon_candidate.exists() {
+                    return Some(icon_candidate);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        find_linux_icon(raw)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_linux_icon(name: &str) -> Option<PathBuf> {
+    let base_dirs = [
+        "/usr/share/icons/hicolor/256x256/apps",
+        "/usr/share/icons/hicolor/128x128/apps",
+        "/usr/share/icons/hicolor/48x48/apps",
+        "/usr/share/pixmaps",
+    ];
+    let extensions = ["png", "ico", "xpm"];
+
+    if name.contains('/') {
+        let path = Path::new(name);
+        if path.exists() {
+            return Some(path.to_path_buf());
+        }
+    }
+
+    for dir in base_dirs {
+        for ext in extensions {
+            let candidate = Path::new(dir).join(format!("{}.{}", name, ext));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
